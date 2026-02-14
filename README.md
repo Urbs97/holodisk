@@ -61,6 +61,8 @@ zig build run -- list master.dat
 
 These are temporary dependencies. The Zig standard library's `std.compress.flate` module is currently undergoing a refactoring that leaves compression unusable in Zig 0.15. Once that work is complete, holodisk will switch to the pure-Zig implementation and drop both the libc and zlib requirements, enabling fully static, cross-compilable builds with no external dependencies.
 
+> **Windows:** Windows support is currently blocked by the zlib system dependency. It will be automatically available once holodisk switches to the Zig standard library's compression. If you need Windows support now, you can vendor zlib and let Zig compile everything from source or [open an issue](../../issues) and ask.
+
 ## DAT2 Format
 
 DAT2 is the archive format used by Fallout 2 for packaging game data. The format stores files with optional zlib compression and uses a trailing metadata tree:
