@@ -231,10 +231,18 @@ pub fn createArchive(allocator: Allocator, source_dir: std.fs.Dir, output_file: 
         try paths.append(allocator, path_copy);
     }
 
-    // Sort alphabetically for deterministic output
+    // Sort case-insensitively using backslash convention so entry order matches the Fallout 2
+    // engine, which uses binary search on tree entries. Paths still use '/' for filesystem reads.
     std.mem.sort([]const u8, paths.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+            const len = @min(a.len, b.len);
+            for (a[0..len], b[0..len]) |ac, bc| {
+                const an: u8 = if (ac == '/') '\\' else std.ascii.toLower(ac);
+                const bn: u8 = if (bc == '/') '\\' else std.ascii.toLower(bc);
+                if (an < bn) return true;
+                if (an > bn) return false;
+            }
+            return a.len < b.len;
         }
     }.lessThan);
 
@@ -420,4 +428,39 @@ test "round-trip compressed" {
 
 test "round-trip uncompressed" {
     try roundTripTest(false);
+}
+
+test "sort order matches DAT2 convention" {
+    const allocator = std.testing.allocator;
+
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer paths.deinit(allocator);
+
+    // These paths exercise both bugs:
+    // 1. Backslash convention: '/' (47) vs '\' (92) changes order around 'A' (65)
+    // 2. Case-insensitivity: 'V' (86) vs 'a' (97) — case-sensitive would put uppercase first
+    try paths.append(allocator, "art/misc/file.frm");
+    try paths.append(allocator, "art/miscA.frm");
+    try paths.append(allocator, "art/cuts/VSUIT.mve");
+    try paths.append(allocator, "art/cuts/afailed.cfg");
+
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            const len = @min(a.len, b.len);
+            for (a[0..len], b[0..len]) |ac, bc| {
+                const an: u8 = if (ac == '/') '\\' else std.ascii.toLower(ac);
+                const bn: u8 = if (bc == '/') '\\' else std.ascii.toLower(bc);
+                if (an < bn) return true;
+                if (an > bn) return false;
+            }
+            return a.len < b.len;
+        }
+    }.lessThan);
+
+    // Case-insensitive: 'a' < 'v', so afailed sorts before VSUIT
+    try std.testing.expectEqualStrings("art/cuts/afailed.cfg", paths.items[0]);
+    try std.testing.expectEqualStrings("art/cuts/VSUIT.mve", paths.items[1]);
+    // Backslash convention: 'a' (97) > '\' (92), so miscA sorts before misc/file
+    try std.testing.expectEqualStrings("art/miscA.frm", paths.items[2]);
+    try std.testing.expectEqualStrings("art/misc/file.frm", paths.items[3]);
 }
