@@ -15,7 +15,10 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
 
       - name: Build
-        run: zig build -DoptimizeMode=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Generate checksums
+        run: sha256sum zig-out/bin/holodisk > zig-out/bin/holodisk.sha256
 
       - name: Create release
         env:
@@ -23,5 +26,6 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" \
             zig-out/bin/holodisk \
+            zig-out/bin/holodisk.sha256 \
             --title "${{ github.ref_name }}" \
             --generate-notes
