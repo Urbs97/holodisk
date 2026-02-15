@@ -139,11 +139,11 @@ pub fn readArchiveFromMemory(allocator: Allocator, data: []const u8) !Archive {
     const tree_size_raw = std.mem.readInt(u32, data[file_size - 8 ..][0..4], .little);
     if (tree_size_raw < 4) return error.TreeSizeInvalid;
 
-    const tree_entries_size: u64 = tree_size_raw - 4;
-    const tree_end: u64 = file_size - 8;
+    const tree_entries_size: usize = tree_size_raw - 4;
+    const tree_end: usize = file_size - 8;
     if (tree_entries_size > tree_end) return error.TreeSizeInvalid;
 
-    const tree_start: u64 = tree_end - tree_entries_size;
+    const tree_start: usize = tree_end - tree_entries_size;
     if (tree_start < 4) return error.TreeSizeInvalid;
 
     // Read num_files
@@ -153,7 +153,7 @@ pub fn readArchiveFromMemory(allocator: Allocator, data: []const u8) !Archive {
     if (num_files > tree_entries_size / 17) return error.TreeParseError;
 
     // Parse tree entries
-    var pos: usize = @intCast(tree_start);
+    var pos: usize = tree_start;
 
     const entries = try allocator.alloc(Entry, num_files);
     errdefer allocator.free(entries);
