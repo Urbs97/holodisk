@@ -245,9 +245,32 @@ fn zlibCompress(allocator: Allocator, input: []const u8) ![]u8 {
     return allocator.realloc(output, compressed_size);
 }
 
-pub fn extractEntry(allocator: Allocator, archive_file: std.fs.File, entry: Entry, output_dir: std.fs.Dir) !void {
-    // Validate decompressed size before allocating
+/// Extract a single entry from an archive file into a caller-owned memory buffer.
+pub fn extractEntryToBuffer(allocator: Allocator, archive_file: std.fs.File, entry: Entry) ![]u8 {
     if (entry.decompressed_size > max_file_size) return error.DecompressionFailed;
+    if (entry.packed_size > max_file_size) return error.DecompressionFailed;
+
+    if (entry.packed_size == 0 and entry.decompressed_size == 0) {
+        return allocator.alloc(u8, 0);
+    }
+
+    try archive_file.seekTo(entry.offset);
+    const raw_data = try allocator.alloc(u8, entry.packed_size);
+
+    if (!entry.is_compressed) {
+        errdefer allocator.free(raw_data);
+        try readExact(archive_file, raw_data);
+        return raw_data;
+    }
+
+    defer allocator.free(raw_data);
+    try readExact(archive_file, raw_data);
+    return zlibDecompress(allocator, raw_data, entry.decompressed_size);
+}
+
+pub fn extractEntry(allocator: Allocator, archive_file: std.fs.File, entry: Entry, output_dir: std.fs.Dir) !void {
+    const output_data = try extractEntryToBuffer(allocator, archive_file, entry);
+    defer allocator.free(output_data);
 
     // Convert backslash paths to forward slash for POSIX
     const path = try allocator.alloc(u8, entry.filename.len);
@@ -261,27 +284,6 @@ pub fn extractEntry(allocator: Allocator, archive_file: std.fs.File, entry: Entr
         try output_dir.makePath(dir);
     }
 
-    // Short-circuit for empty files
-    if (entry.packed_size == 0 and entry.decompressed_size == 0) {
-        const out_file = try output_dir.createFile(path, .{});
-        defer out_file.close();
-        return;
-    }
-
-    // Read raw data from archive
-    try archive_file.seekTo(entry.offset);
-    const raw_data = try allocator.alloc(u8, entry.packed_size);
-    defer allocator.free(raw_data);
-    try readExact(archive_file, raw_data);
-
-    // Decompress if needed
-    const output_data = if (entry.is_compressed)
-        try zlibDecompress(allocator, raw_data, entry.decompressed_size)
-    else
-        raw_data;
-    defer if (entry.is_compressed) allocator.free(output_data);
-
-    // Write file
     const out_file = try output_dir.createFile(path, .{});
     defer out_file.close();
     try out_file.writeAll(output_data);
@@ -581,6 +583,60 @@ test "sort order matches DAT2 convention" {
     // Backslash convention: 'a' (97) > '\' (92), so miscA sorts before misc/file
     try std.testing.expectEqualStrings("art/miscA.frm", paths.items[2]);
     try std.testing.expectEqualStrings("art/misc/file.frm", paths.items[3]);
+}
+
+test "extractEntryToBuffer" {
+    const allocator = std.testing.allocator;
+
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+
+    const file1_content = "Hello, World!";
+    const file2_content = "This is a test file with some content.\nLine 2.\n";
+    const file3_content = "";
+
+    try source_tmp.dir.writeFile(.{ .sub_path = "file1.txt", .data = file1_content });
+    try source_tmp.dir.makePath("subdir");
+    try source_tmp.dir.writeFile(.{ .sub_path = "subdir/file2.txt", .data = file2_content });
+    try source_tmp.dir.writeFile(.{ .sub_path = "empty.txt", .data = file3_content });
+
+    // Create compressed archive
+    var archive_tmp = std.testing.tmpDir(.{});
+    defer archive_tmp.cleanup();
+
+    const archive_file = try archive_tmp.dir.createFile("test.dat2", .{ .read = true });
+    defer archive_file.close();
+
+    try createArchive(allocator, source_tmp.dir, archive_file, .{ .compress = true });
+
+    try archive_file.seekTo(0);
+    var archive = try readArchive(allocator, archive_file);
+    defer archive.deinit();
+
+    // Sorted order: empty.txt, file1.txt, subdir\file2.txt
+    const expected = [_][]const u8{ file3_content, file1_content, file2_content };
+
+    for (archive.entries, 0..) |entry, i| {
+        const buf = try extractEntryToBuffer(allocator, archive_file, entry);
+        defer allocator.free(buf);
+        try std.testing.expectEqualStrings(expected[i], buf);
+    }
+
+    // Also test with an uncompressed archive
+    const archive_file2 = try archive_tmp.dir.createFile("test_uncomp.dat2", .{ .read = true });
+    defer archive_file2.close();
+
+    try createArchive(allocator, source_tmp.dir, archive_file2, .{ .compress = false });
+
+    try archive_file2.seekTo(0);
+    var archive2 = try readArchive(allocator, archive_file2);
+    defer archive2.deinit();
+
+    for (archive2.entries, 0..) |entry, i| {
+        const buf = try extractEntryToBuffer(allocator, archive_file2, entry);
+        defer allocator.free(buf);
+        try std.testing.expectEqualStrings(expected[i], buf);
+    }
 }
 
 test "round-trip from memory" {
