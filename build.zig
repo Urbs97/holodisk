@@ -4,13 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const is_wasm = target.result.cpu.arch.isWasm();
+
     const mod = b.addModule("holodisk", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.linkSystemLibrary("z", .{});
+    if (!is_wasm) {
+        mod.linkSystemLibrary("z", .{});
+    }
 
     const exe = b.addExecutable(.{
         .name = "holodisk",
