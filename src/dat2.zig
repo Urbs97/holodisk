@@ -381,6 +381,171 @@ fn writeFooter(io: Io, file: File, start: u64, entries: []const Entry) !void {
     try file.setLength(io, pos);
 }
 
+pub fn replaceEntry(
+    allocator: Allocator,
+    io: Io,
+    archive_file: File,
+    archive: *Archive,
+    entry_index: usize,
+    new_data: []const u8,
+    compress: bool,
+) !void {
+    if (entry_index >= archive.entries.len) return error.EntryOutOfBounds;
+
+    // Read current footer to locate the data section end
+    const end_pos = try archive_file.length(io);
+    const end_pos_32 = std.math.cast(u32, end_pos) orelse return error.FileTooLarge;
+    if (end_pos < 12) return error.FileTooSmall;
+    const file_size = try readU32LeAt(io, archive_file, end_pos - 4);
+    if (file_size != end_pos_32) return error.FileSizeMismatch;
+    const tree_size = try readU32LeAt(io, archive_file, end_pos - 8);
+    if (tree_size < 4) return error.TreeSizeInvalid;
+
+    const tree_entries_size: u32 = tree_size - 4;
+    const tree_end: u32 = file_size - 8;
+    if (tree_entries_size > tree_end) return error.TreeSizeInvalid;
+
+    const tree_start: u32 = tree_end - tree_entries_size;
+    if (tree_start < 4) return error.TreeSizeInvalid;
+
+    // data_end = tree_start - 4(num_files)
+    const data_end: u32 = tree_start - 4;
+
+    // Compress if requested; fall back to uncompressed when compression doesn't help
+    const compressed = if (compress and new_data.len > 0) try zlibCompress(allocator, new_data) else null;
+    defer if (compressed) |buf| allocator.free(buf);
+
+    const use_compressed = compressed != null and compressed.?.len < new_data.len;
+    const write_data = if (use_compressed) compressed.? else new_data;
+
+    // Always append at data_end rather than reusing the old slot. This ensures
+    // existing entry data is never overwritten. Dead space is reclaimed by
+    // compactArchive. Note: a crash mid-write can leave the footer incomplete,
+    // making the archive unreadable until repaired.
+    const old_entry = archive.entries[entry_index];
+
+    try archive_file.writePositionalAll(io, write_data, data_end);
+
+    // Update in-memory entry; restore on footer-write failure
+    archive.entries[entry_index] = .{
+        .filename = old_entry.filename,
+        .offset = data_end,
+        .packed_size = std.math.cast(u32, write_data.len) orelse return error.FileTooLarge,
+        .decompressed_size = std.math.cast(u32, new_data.len) orelse return error.FileTooLarge,
+        .is_compressed = use_compressed,
+    };
+    errdefer archive.entries[entry_index] = old_entry;
+
+    try writeFooter(io, archive_file, @as(u64, data_end) + write_data.len, archive.entries);
+}
+
+pub const CompactOptions = struct {
+    /// Keep the original file contents in memory so the archive can be
+    /// restored if compaction fails partway through. When false, a failure
+    /// leaves both the on-disk file and the in-memory entry offsets in an
+    /// inconsistent, irrecoverable state.
+    safe: bool = false,
+};
+
+pub fn compactArchive(
+    allocator: Allocator,
+    io: Io,
+    archive_file: File,
+    archive: *Archive,
+    options: CompactOptions,
+) !void {
+    if (archive.entries.len == 0) return;
+
+    // Snapshot the original file so we can restore on failure
+    const end_pos = try archive_file.length(io);
+    const end_pos_usize = std.math.cast(usize, end_pos) orelse return error.FileTooLarge;
+    const snapshot = if (options.safe) blk: {
+        const buf = try allocator.alloc(u8, end_pos_usize);
+        errdefer allocator.free(buf);
+        try readExactAt(io, archive_file, buf, 0);
+        break :blk buf;
+    } else null;
+    defer if (snapshot) |s| allocator.free(s);
+
+    // Save original entry offsets so we can roll back the in-memory state
+    const old_offsets = if (options.safe) blk: {
+        const offsets = try allocator.alloc(u32, archive.entries.len);
+        for (archive.entries, 0..) |entry, i| offsets[i] = entry.offset;
+        break :blk offsets;
+    } else null;
+    defer if (old_offsets) |o| allocator.free(o);
+
+    compactArchiveInner(allocator, io, archive_file, archive, snapshot) catch |err| {
+        if (snapshot) |s| {
+            // Restore in-memory offsets regardless of file restore outcome
+            defer for (archive.entries, 0..) |*entry, i| {
+                entry.offset = old_offsets.?[i];
+            };
+            // Restore original file contents
+            archive_file.writePositionalAll(io, s, 0) catch return err;
+            archive_file.setLength(io, end_pos) catch return err;
+        }
+        return err;
+    };
+}
+
+fn compactArchiveInner(
+    allocator: Allocator,
+    io: Io,
+    archive_file: File,
+    archive: *Archive,
+    snapshot: ?[]const u8,
+) !void {
+    // Build index sorted by offset so we always move data forward (no overlap)
+    const indices = try allocator.alloc(usize, archive.entries.len);
+    defer allocator.free(indices);
+    for (indices, 0..) |*idx, i| idx.* = i;
+
+    std.mem.sort(usize, indices, archive.entries, struct {
+        fn lessThan(entries: []Entry, a: usize, b: usize) bool {
+            return entries[a].offset < entries[b].offset;
+        }
+    }.lessThan);
+
+    // When we have a snapshot we can read entry data directly from it,
+    // otherwise allocate a temporary buffer for file-based reads.
+    var max_packed: u32 = 0;
+    if (snapshot == null) {
+        for (archive.entries) |entry| {
+            if (entry.packed_size > max_packed) max_packed = entry.packed_size;
+        }
+    }
+
+    const buf = if (max_packed > 0) try allocator.alloc(u8, max_packed) else @as([]u8, &.{});
+    defer if (max_packed > 0) allocator.free(buf);
+
+    // Compact: move each entry's data forward to eliminate gaps
+    var write_pos: u32 = 0;
+    for (indices) |idx| {
+        const entry = &archive.entries[idx];
+        if (entry.packed_size == 0) {
+            entry.offset = write_pos;
+            continue;
+        }
+
+        if (entry.offset != write_pos) {
+            const data: []const u8 = if (snapshot) |s|
+                s[entry.offset..][0..entry.packed_size]
+            else blk: {
+                try readExactAt(io, archive_file, buf[0..entry.packed_size], entry.offset);
+                break :blk @as([]const u8, buf[0..entry.packed_size]);
+            };
+            try archive_file.writePositionalAll(io, data, write_pos);
+        }
+
+        entry.offset = write_pos;
+        write_pos += entry.packed_size;
+    }
+
+    // Rewrite footer at the new data end
+    try writeFooter(io, archive_file, write_pos, archive.entries);
+}
+
 pub const CreateOptions = struct {
     compress: bool = true,
 };
@@ -722,4 +887,163 @@ test "round-trip from memory" {
     try std.testing.expectEqualStrings(file3_content, results[0]);
     try std.testing.expectEqualStrings(file1_content, results[1]);
     try std.testing.expectEqualStrings(file2_content, results[2]);
+}
+
+test "replaceEntry" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Create source directory with test files
+    var source_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    try writeTestSources(io, source_tmp.dir);
+
+    // Create compressed archive
+    var archive_tmp = std.testing.tmpDir(.{});
+    defer archive_tmp.cleanup();
+
+    const archive_file = try archive_tmp.dir.createFile(io, "test.dat2", .{ .read = true });
+    defer archive_file.close(io);
+
+    try createArchive(allocator, io, source_tmp.dir, archive_file, .{ .compress = true });
+
+    // Read archive back
+    var archive = try readArchive(allocator, io, archive_file);
+    defer archive.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), archive.entries.len);
+    const file1_idx = for (archive.entries, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry.filename, "file1.txt")) break i;
+    } else return error.TestUnexpectedResult;
+
+    // Replace file1.txt with new content
+    const new_content = "Replaced content! This is entirely different data.";
+    try replaceEntry(allocator, io, archive_file, &archive, file1_idx, new_content, true);
+
+    // Verify in-memory entry was updated
+    try std.testing.expectEqual(@as(u32, new_content.len), archive.entries[file1_idx].decompressed_size);
+    try std.testing.expectEqual(true, archive.entries[file1_idx].is_compressed);
+
+    // Re-read the archive from disk to verify on-disk consistency
+    var archive2 = try readArchive(allocator, io, archive_file);
+    defer archive2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), archive2.entries.len);
+    const file1_idx2 = for (archive2.entries, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry.filename, "file1.txt")) break i;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, new_content.len), archive2.entries[file1_idx2].decompressed_size);
+
+    // Extract the replaced entry and verify new content
+    const extracted = try extractEntryToBuffer(allocator, io, archive_file, archive2.entries[file1_idx2]);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualStrings(new_content, extracted);
+
+    // Verify other entries are unchanged
+    const original_contents = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "empty.txt", .data = file3_content },
+        .{ .name = "subdir\\file2.txt", .data = file2_content },
+    };
+    for (archive2.entries) |entry| {
+        if (std.mem.eql(u8, entry.filename, "file1.txt")) continue;
+        const content = for (original_contents) |item| {
+            if (std.mem.eql(u8, entry.filename, item.name)) break item.data;
+        } else unreachable;
+        const buf = try extractEntryToBuffer(allocator, io, archive_file, entry);
+        defer allocator.free(buf);
+        try std.testing.expectEqualStrings(content, buf);
+    }
+}
+
+test "replaceEntry always appends to preserve old data" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var source_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+
+    // Use uncompressed so packed_size == data.len for predictable slot sizes
+    try source_tmp.dir.writeFile(io, .{ .sub_path = "file1.txt", .data = "AAAAAAAAAA" }); // 10 bytes
+    try source_tmp.dir.writeFile(io, .{ .sub_path = "file2.txt", .data = "BBBBBBBBBB" }); // 10 bytes
+
+    var archive_tmp = std.testing.tmpDir(.{});
+    defer archive_tmp.cleanup();
+
+    const archive_file = try archive_tmp.dir.createFile(io, "test.dat2", .{ .read = true });
+    defer archive_file.close(io);
+
+    try createArchive(allocator, io, source_tmp.dir, archive_file, .{ .compress = false });
+
+    var archive = try readArchive(allocator, io, archive_file);
+    defer archive.deinit();
+
+    try std.testing.expectEqualStrings("file1.txt", archive.entries[0].filename);
+
+    const old_offset = archive.entries[0].offset;
+
+    // Replace with smaller data — should still append (not reuse old slot)
+    try replaceEntry(allocator, io, archive_file, &archive, 0, "CCCCC", false);
+
+    // Offset should have changed (appended, old data preserved)
+    try std.testing.expect(archive.entries[0].offset != old_offset);
+
+    // Verify data round-trips correctly
+    var archive2 = try readArchive(allocator, io, archive_file);
+    defer archive2.deinit();
+
+    const extracted = try extractEntryToBuffer(allocator, io, archive_file, archive2.entries[0]);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualStrings("CCCCC", extracted);
+
+    const extracted1 = try extractEntryToBuffer(allocator, io, archive_file, archive2.entries[1]);
+    defer allocator.free(extracted1);
+    try std.testing.expectEqualStrings("BBBBBBBBBB", extracted1);
+}
+
+test "compactArchive removes dead space" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var source_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+
+    // Uncompressed for predictable sizes
+    try source_tmp.dir.writeFile(io, .{ .sub_path = "file1.txt", .data = "AAAAAAAAAA" }); // 10 bytes
+    try source_tmp.dir.writeFile(io, .{ .sub_path = "file2.txt", .data = "BBBBBBBBBB" }); // 10 bytes
+
+    var archive_tmp = std.testing.tmpDir(.{});
+    defer archive_tmp.cleanup();
+
+    const archive_file = try archive_tmp.dir.createFile(io, "test.dat2", .{ .read = true });
+    defer archive_file.close(io);
+
+    try createArchive(allocator, io, source_tmp.dir, archive_file, .{ .compress = false });
+
+    var archive = try readArchive(allocator, io, archive_file);
+    defer archive.deinit();
+
+    // Replace with larger data to force an append (creates dead space at old slot)
+    try replaceEntry(allocator, io, archive_file, &archive, 0, "CCCCCCCCCCCCCCCC", false); // 16 bytes > 10
+
+    const size_before_compact = try archive_file.length(io);
+
+    // Compact should reclaim the 10 bytes of dead space
+    try compactArchive(allocator, io, archive_file, &archive, .{ .safe = true });
+
+    const size_after_compact = try archive_file.length(io);
+    try std.testing.expect(size_after_compact < size_before_compact);
+
+    // Verify the archive is still valid and data is correct
+    var archive2 = try readArchive(allocator, io, archive_file);
+    defer archive2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), archive2.entries.len);
+
+    const extracted0 = try extractEntryToBuffer(allocator, io, archive_file, archive2.entries[0]);
+    defer allocator.free(extracted0);
+    try std.testing.expectEqualStrings("CCCCCCCCCCCCCCCC", extracted0);
+
+    const extracted1 = try extractEntryToBuffer(allocator, io, archive_file, archive2.entries[1]);
+    defer allocator.free(extracted1);
+    try std.testing.expectEqualStrings("BBBBBBBBBB", extracted1);
 }
